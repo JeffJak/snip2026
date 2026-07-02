@@ -30,6 +30,13 @@ Clone with submodules initialized:
 git clone --recurse-submodules https://github.com/JeffJak/snip2026.git
 ```
 
+To build and publish the generated release bundle from the main superproject:
+
+```bash
+node scripts/build-bundle.mjs
+node scripts/build-bundle.mjs --push
+```
+
 Run each layer from its submodule directory:
 
 ```bash
