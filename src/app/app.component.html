@@ -1,0 +1,56 @@
+<main>
+  <section class="card">
+    <header>
+      <p class="eyebrow">Snip</p>
+      <h1>Shorten a URL</h1>
+      <p class="subtitle">Paste a link, create a short code, and track how often it is used.</p>
+    </header>
+
+    <form (ngSubmit)="submit()" #form="ngForm">
+      <label class="field">
+        <span>Link</span>
+        <input
+          [(ngModel)]="url"
+          name="url"
+          type="url"
+          placeholder="https://example.com"
+          required
+        />
+      </label>
+      <button type="submit" [disabled]="linkService.loading() || !isValidUrl()">Shorten</button>
+    </form>
+
+    @if (linkService.error()) {
+      <p class="message error">{{ linkService.error() }}</p>
+    }
+    @if (linkService.success()) {
+      <p class="message success">Created: <a [href]="linkService.success()" target="_blank" rel="noopener">{{ linkService.success() }}</a></p>
+    }
+
+    <section class="table-wrap">
+      <h2>Recent links</h2>
+      @if (linkService.loading()) {
+        <p class="muted">Loading…</p>
+      } @else {
+        <table>
+          <thead>
+            <tr>
+              <th>Code</th>
+              <th>Original</th>
+              <th>Hits</th>
+            </tr>
+          </thead>
+          <tbody>
+            @for (link of linkService.links(); track link.code) {
+              <tr>
+                <td><a [href]="link.shortUrl" target="_blank" rel="noopener">{{ link.code }}</a></td>
+                <td class="url-cell"><a [href]="link.url" target="_blank" rel="noopener">{{ link.url }}</a></td>
+                <td>{{ link.hits }}</td>
+              </tr>
+            }
+          </tbody>
+        </table>
+      }
+    </section>
+  </section>
+</main>
