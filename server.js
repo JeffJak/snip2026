@@ -1,124 +1,161 @@
-import { existsSync, statSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { join, resolve, normalize } from "node:path";
+import { existsSync, statSync } from "node:fs";
 
-const port = Number(process.env.PORT || 3000);
-const baseUrl = process.env.BASE_URL || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : `http://localhost:${port}`);
-const publicDir = process.env.PUBLIC_DIR ? resolve(process.env.PUBLIC_DIR) : null;
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+const PORT = parseInt(process.env.PORT ?? "3000", 10);
+const BASE_URL = (
+  process.env.BASE_URL ??
+  (process.env.RAILWAY_PUBLIC_DOMAIN
+    ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+    : `http://localhost:${PORT}`)
+).replace(/\/$/, "");
+const PUBLIC_DIR = process.env.PUBLIC_DIR
+  ? resolve(process.env.PUBLIC_DIR)
+  : null;
+
+// ---------------------------------------------------------------------------
+// In-memory store
+// ---------------------------------------------------------------------------
+/** @type {Map<string, {code:string,url:string,shortUrl:string,hits:number,createdAt:string}>} */
 const links = new Map();
 
-function makeCode() {
-  const chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
-  let code = '';
-  for (let i = 0; i < 6; i += 1) {
-    code += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return code;
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+const BASE62 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+function generateCode() {
+  const bytes = crypto.getRandomValues(new Uint8Array(6));
+  return Array.from(bytes, (b) => BASE62[b % 62]).join("");
 }
 
-function isHttpUrl(value) {
-  if (typeof value !== 'string') return false;
-  try {
-    const url = new URL(value);
-    return url.protocol === 'http:' || url.protocol === 'https:';
-  } catch {
-    return false;
-  }
-}
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
 
-function buildJsonResponse(body, status = 200) {
-  return new Response(JSON.stringify(body), {
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
     status,
-    headers: {
-      'Content-Type': 'application/json; charset=utf-8',
-      'Access-Control-Allow-Origin': '*',
-    },
+    headers: { "Content-Type": "application/json", ...CORS },
   });
 }
 
-function resolvePublicFile(pathname) {
-  if (!publicDir) return null;
-  const requestPath = pathname === '/' ? '/index.html' : pathname;
-  const normalized = requestPath.replace(/^\/+/, '');
-  const filePath = resolve(publicDir, normalized);
-  if (!filePath.startsWith(publicDir)) return null;
-  if (existsSync(filePath) && statSync(filePath).isFile()) {
-    return filePath;
+/**
+ * Attempt to serve a static file from PUBLIC_DIR.
+ * "/" maps to index.html. Resolves to null if nothing found or path escapes PUBLIC_DIR.
+ */
+function serveStatic(pathname) {
+  if (!PUBLIC_DIR) return null;
+
+  // Prevent path traversal: normalize first, then resolve inside PUBLIC_DIR
+  const relative = normalize(pathname === "/" ? "/index.html" : pathname);
+  const filePath = resolve(join(PUBLIC_DIR, relative));
+
+  // Ensure the resolved path is strictly inside PUBLIC_DIR
+  if (!filePath.startsWith(PUBLIC_DIR + "/") && filePath !== PUBLIC_DIR) {
+    return null;
   }
-  return null;
+
+  if (!existsSync(filePath) || statSync(filePath).isDirectory()) return null;
+
+  return new Response(Bun.file(filePath), { headers: { ...CORS } });
 }
 
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
 Bun.serve({
-  port,
-  fetch(req) {
-    const url = new URL(req.url);
-    const corsHeaders = {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-    };
+  port: PORT,
 
-    if (req.method === 'OPTIONS') {
-      return new Response(null, { status: 204, headers: corsHeaders });
+  async fetch(req) {
+    const { pathname } = new URL(req.url);
+    const method = req.method;
+
+    // ------------------------------------------------------------------
+    // OPTIONS preflight
+    // ------------------------------------------------------------------
+    if (method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: CORS });
     }
 
-    if (req.method === 'POST' && url.pathname === '/api/links') {
-      return (async () => {
-        let bodyText = '';
-        try {
-          bodyText = await req.text();
-        } catch {
-          return buildJsonResponse({ error: 'Invalid JSON' }, 400);
-        }
+    // ------------------------------------------------------------------
+    // POST /api/links  — create short link
+    // ------------------------------------------------------------------
+    if (method === "POST" && pathname === "/api/links") {
+      let body;
+      try {
+        body = await req.json();
+      } catch {
+        return json({ error: "Invalid JSON" }, 400);
+      }
 
-        let payload;
-        try {
-          payload = JSON.parse(bodyText);
-        } catch {
-          return buildJsonResponse({ error: 'Invalid JSON' }, 400);
-        }
+      const rawUrl = body?.url;
+      if (typeof rawUrl !== "string") {
+        return json({ error: "url must be a string" }, 400);
+      }
 
-        if (!payload || typeof payload.url !== 'string' || !isHttpUrl(payload.url)) {
-          return buildJsonResponse({ error: 'Invalid URL' }, 400);
-        }
+      let parsed;
+      try {
+        parsed = new URL(rawUrl);
+      } catch {
+        return json({ error: "Invalid URL" }, 400);
+      }
 
-        const code = makeCode();
-        const createdAt = new Date().toISOString();
-        const record = { code, url: payload.url, shortUrl: `${baseUrl}/${code}`, hits: 0, createdAt };
-        links.set(code, record);
-        return buildJsonResponse(record, 201);
-      })();
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        return json({ error: "URL must use http or https" }, 400);
+      }
+
+      // Generate a collision-free 6-char base62 code
+      let code;
+      do {
+        code = generateCode();
+      } while (links.has(code));
+
+      const entry = {
+        code,
+        url: rawUrl,
+        shortUrl: `${BASE_URL}/${code}`,
+        hits: 0,
+        createdAt: new Date().toISOString(),
+      };
+      links.set(code, entry);
+      return json(entry, 201);
     }
 
-    if (req.method === 'GET' && url.pathname === '/api/links') {
-      return buildJsonResponse(Array.from(links.values()));
+    // ------------------------------------------------------------------
+    // GET /api/links  — list all links
+    // ------------------------------------------------------------------
+    if (method === "GET" && pathname === "/api/links") {
+      return json([...links.values()]);
     }
 
-    if (req.method === 'GET') {
-      const publicFile = resolvePublicFile(url.pathname);
-      if (publicFile) {
-        return new Response(Bun.file(publicFile), {
-          headers: { 'Access-Control-Allow-Origin': '*' },
+    // ------------------------------------------------------------------
+    // GET /*  — static file (wins over short code) then redirect
+    // ------------------------------------------------------------------
+    if (method === "GET") {
+      const staticRes = serveStatic(pathname);
+      if (staticRes) return staticRes;
+
+      const code = pathname.slice(1); // strip leading "/"
+      const entry = links.get(code);
+      if (entry) {
+        entry.hits++;
+        return new Response(null, {
+          status: 302,
+          headers: { Location: entry.url, ...CORS },
         });
       }
 
-      const code = url.pathname.replace(/^\/+/, '');
-      if (code && links.has(code)) {
-        const link = links.get(code);
-        link.hits += 1;
-        return Response.redirect(link.url, 302);
-      }
-
-      return new Response('Not Found', {
-        status: 404,
-        headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' },
-      });
+      return json({ error: "Not found" }, 404);
     }
 
-    return new Response('Not Found', {
-      status: 404,
-      headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' },
-    });
+    return json({ error: "Method not allowed" }, 405);
   },
 });
 
-console.log(`Snip backend listening on http://localhost:${port}`);
+console.log(`Snip listening on :${PORT}  BASE_URL=${BASE_URL}`);
+if (PUBLIC_DIR) console.log(`Static files → ${PUBLIC_DIR}`);
